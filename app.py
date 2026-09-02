@@ -1,103 +1,149 @@
 import streamlit as st
-from docx import Document
-from docx.shared import Pt, Inches
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
 from notion_client import Client
 import requests
 import io
+import base64
 import re
+import pdfkit
 
-# ==========================================
-# 1. CẤU HÌNH API KEY CỦA BẠN Ở ĐÂY
-# ==========================================
-NOTION_API_KEY = st.secrets["NOTION_API_KEY"] # Thay bằng API Key của bạn
+# Lấy API Key từ Streamlit Secrets
+NOTION_API_KEY = st.secrets["NOTION_API_KEY"]
 notion = Client(auth=NOTION_API_KEY)
 
-# ==========================================
-# HÀM HỖ TRỢ XỬ LÝ WORD
-# ==========================================
-def set_document_font(doc, font_name='Montserrat', font_size=14):
-    """Cài đặt font chữ mặc định cho toàn bộ tài liệu"""
-    style = doc.styles['Normal']
-    font = style.font
-    font.name = font_name
-    font.size = Pt(font_size)
-
 def extract_page_id(url):
-    # Lấy phần chính của URL, bỏ qua các thông số tracking phía sau dấu ?
+    """Trích xuất ID an toàn, bỏ qua ngày tháng trùng lặp"""
     base_url = url.split('?')[0]
-    # Lấy đoạn cuối cùng của link
     last_segment = base_url.split('/')[-1]
-    # Xóa toàn bộ dấu gạch ngang
     clean_segment = last_segment.replace("-", "")
-    # Luôn lấy chính xác 32 ký tự cuối cùng (độ dài chuẩn của Notion ID)
     if len(clean_segment) >= 32:
         return clean_segment[-32:]
     return None
 
-def parse_notion_blocks(blocks, doc):
-    """Hàm duyệt qua các block của Notion và đẩy vào Word"""
+def get_page_title(page_id):
+    """Lấy tiêu đề trang từ API và làm sạch để làm tên file"""
+    try:
+        page = notion.pages.retrieve(page_id=page_id)
+        # Quét các thuộc tính của trang để tìm trường chứa tiêu đề (type = title)
+        for prop in page['properties'].values():
+            if prop['type'] == 'title':
+                if prop['title']:
+                    raw_title = "".join([t['plain_text'] for t in prop['title']])
+                    # Lọc bỏ các ký tự cấm trong tên file của Windows/Mac
+                    clean_title = re.sub(r'[\\/*?:"<>|]', "", raw_title)
+                    return clean_title.strip()
+    except Exception:
+        pass
+    # Tên mặc định dự phòng nếu có lỗi xảy ra
+    return "Notion_Export"
+
+def image_to_base64(url):
+    """Chuyển ảnh từ Notion thành Base64 để nhúng an toàn vào file PDF"""
+    try:
+        response = requests.get(url)
+        return base64.b64encode(response.content).decode('utf-8')
+    except:
+        return ""
+
+def parse_blocks_to_html(blocks):
+    """Chuyển đổi các khối Notion thành mã HTML"""
+    html_content = ""
     for block in blocks:
-        block_type = block.get('type')
+        b_type = block['type']
         
-        # 1. Xử lý Văn bản thường (Paragraph)
-        if block_type == 'paragraph':
+        if b_type == 'paragraph':
             text = "".join([t['plain_text'] for t in block['paragraph']['rich_text']])
-            if text.strip():
-                doc.add_paragraph(text)
-                
-        # 2. Xử lý Tiêu đề (Heading 1, 2, 3)
-        elif block_type in ['heading_1', 'heading_2', 'heading_3']:
-            level = int(block_type[-1])
-            text = "".join([t['plain_text'] for t in block[block_type]['rich_text']])
-            doc.add_heading(text, level=level)
+            html_content += f"<p>{text}</p>" if text.strip() else "<br>"
             
-        # 3. Xử lý Hình ảnh
-        elif block_type == 'image':
+        elif b_type in ['heading_1', 'heading_2', 'heading_3']:
+            level = b_type[-1]
+            text = "".join([t['plain_text'] for t in block[b_type]['rich_text']])
+            html_content += f"<h{level}>{text}</h{level}>"
+            
+        elif b_type == 'equation':
+            expr = block['equation']['expression']
+            # BỘ LỌC TỰ ĐỘNG: Bỏ qua mã LaTeX tạo đường kẻ ngang/dọc của template
+            if "\\rule" not in expr and "\\color" not in expr:
+                html_content += f"<p><i>{expr}</i></p>"
+                
+        elif b_type == 'image':
             image_type = block['image']['type']
             image_url = block['image'][image_type]['url']
-            try:
-                # Tải ảnh từ URL của Notion
-                response = requests.get(image_url)
-                image_stream = io.BytesIO(response.content)
-                # Chèn ảnh vào Word, chỉnh chiều rộng vừa phải để không bị tràn
-                doc.add_picture(image_stream, width=Inches(6.0))
-            except Exception as e:
-                doc.add_paragraph(f"[Lỗi không thể tải hình ảnh: {str(e)}]")
+            b64_img = image_to_base64(image_url)
+            if b64_img:
+                html_content += f'<img src="data:image/png;base64,{b64_img}" style="max-width:100%; border-radius:8px; margin: 10px 0;">'
                 
-        # 4. Xử lý Cột (Giả lập bằng Table ẩn viền để chống lỗi ngắt trang)
-        elif block_type == 'column_list':
-            # Lấy các cột con bên trong block column_list
+        elif b_type == 'column_list':
             columns = notion.blocks.children.list(block_id=block['id']).get('results', [])
-            num_cols = len(columns)
+            html_content += '<table class="cornell-table"><tr>'
+            for i, col in enumerate(columns):
+                # Chia cột 30% (Keyword) và 70% (Note), tạo viền xám giả lập đường kẻ LaTeX
+                col_class = "col-left" if i == 0 else "col-right"
+                html_content += f'<td class="{col_class}">'
+                col_blocks = notion.blocks.children.list(block_id=col['id']).get('results', [])
+                html_content += parse_blocks_to_html(col_blocks) # Đệ quy để lấy nội dung trong cột
+                html_content += '</td>'
+            html_content += '</tr></table>'
             
-            if num_cols > 0:
-                table = doc.add_table(rows=1, cols=num_cols)
-                table.autofit = True
-                
-                # Duyệt qua từng cột
-                for i, col in enumerate(columns):
-                    col_blocks = notion.blocks.children.list(block_id=col['id']).get('results', [])
-                    cell = table.cell(0, i)
-                    
-                    # Lấy text của từng block trong cột và gộp lại
-                    cell_text = ""
-                    for cb in col_blocks:
-                        if cb['type'] == 'paragraph':
-                            cell_text += "".join([t['plain_text'] for t in cb['paragraph']['rich_text']]) + "\n"
-                        # Có thể mở rộng để xử lý ảnh/list bên trong cột ở đây
-                    
-                    cell.text = cell_text.strip()
-            doc.add_paragraph() # Thêm dòng trống sau bảng
+    return html_content
 
-# ==========================================
-# 2. GIAO DIỆN STREAMLIT
-# ==========================================
-st.set_page_config(page_title="Notion to Word", layout="centered")
+def generate_pdf(html_body):
+    """Ghép CSS (Font, Size, Layout) và xuất PDF"""
+    full_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600&display=swap" rel="stylesheet">
+        <style>
+            body {{
+                font-family: 'Montserrat', sans-serif;
+                font-size: 14pt;
+                line-height: 1.6;
+                color: #333;
+            }}
+            .cornell-table {{
+                width: 100%;
+                border-collapse: collapse;
+                page-break-inside: auto;
+                margin-bottom: 20px;
+            }}
+            tr {{ page-break-inside: avoid; page-break-after: auto; }}
+            td {{ vertical-align: top; padding: 15px; }}
+            .col-left {{ 
+                width: 30%; 
+                border-right: 2px solid #EBECED; 
+                font-weight: 600;
+            }}
+            .col-right {{ width: 70%; }}
+        </style>
+    </head>
+    <body>
+        {html_body}
+    </body>
+    </html>
+    """
+    options = {
+        'page-size': 'A4',
+        'margin-top': '0.75in',
+        'margin-right': '0.75in',
+        'margin-bottom': '0.75in',
+        'margin-left': '0.75in',
+        'encoding': "UTF-8",
+        'enable-local-file-access': None
+    }
+    pdf_bytes = pdfkit.from_string(full_html, False, options=options)
+    return pdf_bytes
 
-# Giao diện cực kỳ đơn giản theo yêu cầu
-st.title("Chuyển đổi Notion sang Word")
+def show_pdf_preview(pdf_bytes):
+    """Hiển thị bản xem trước PDF trực tiếp trên web"""
+    base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
+    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="800" type="application/pdf"></iframe>'
+    st.markdown(pdf_display, unsafe_allow_html=True)
+
+# Giao diện Streamlit
+st.set_page_config(page_title="Notion to PDF", layout="wide")
+st.title("Chuyển đổi Notion sang PDF")
+
 notion_url = st.text_input("Nhập link Notion của bạn vào đây:")
 
 if notion_url:
@@ -107,34 +153,33 @@ if notion_url:
         st.error("Link Notion không hợp lệ. Vui lòng kiểm tra lại.")
     else:
         if st.button("Bắt đầu xử lý"):
-            with st.spinner("Đang tải dữ liệu và tạo file Word..."):
+            with st.spinner("Đang trích xuất dữ liệu và dàn trang PDF..."):
                 try:
-                    # Khởi tạo Word
-                    doc = Document()
-                    set_document_font(doc, 'Montserrat', 14)
+                    # Lấy tiêu đề trang
+                    page_title = get_page_title(page_id)
                     
-                    # Lấy tiêu đề trang (tuỳ chọn, để làm tên file)
-                    page_data = notion.pages.retrieve(page_id=page_id)
-                    
-                    # Lấy nội dung các blocks của trang
+                    # Lấy dữ liệu nội dung
                     blocks = notion.blocks.children.list(block_id=page_id).get('results', [])
+                    html_body = parse_blocks_to_html(blocks)
                     
-                    # Xử lý nội dung
-                    parse_notion_blocks(blocks, doc)
+                    # Tạo PDF
+                    pdf_bytes = generate_pdf(html_body)
+                    st.success(f"Tạo file '{page_title}.pdf' thành công!")
                     
-                    # Lưu file vào bộ nhớ đệm (BytesIO) để người dùng tải về
-                    docx_stream = io.BytesIO()
-                    doc.save(docx_stream)
-                    docx_stream.seek(0)
+                    # Chia giao diện làm 2 cột: Trái để nút tải, Phải để Preview
+                    col1, col2 = st.columns([1, 3])
                     
-                    st.success("Tạo file thành công!")
-                    
-                    # Nút tải file
-                    st.download_button(
-                        label="Tải file Word (.docx) xuống",
-                        data=docx_stream,
-                        file_name="Notion_Export.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    )
+                    with col1:
+                        st.download_button(
+                            label="Tải file PDF xuống",
+                            data=pdf_bytes,
+                            file_name=f"{page_title}.pdf",
+                            mime="application/pdf"
+                        )
+                        
+                    with col2:
+                        st.markdown("### Bản xem trước (Preview)")
+                        show_pdf_preview(pdf_bytes)
+                        
                 except Exception as e:
-                    st.error(f"Đã xảy ra lỗi: {str(e)}\n\n(Bạn đã Share trang này với Integration API chưa?)")
+                    st.error(f"Đã xảy ra lỗi: {str(e)}\n\nVui lòng đảm bảo bạn đã Share trang Notion với Integration.")
