@@ -6,6 +6,7 @@ import re
 from weasyprint import HTML
 import fitz  # PyMuPDF
 
+# Lấy API Key từ Streamlit Secrets
 NOTION_API_KEY = st.secrets["NOTION_API_KEY"]
 notion = Client(auth=NOTION_API_KEY)
 
@@ -30,7 +31,7 @@ def get_page_title(page_id):
     return "Notion_Export"
 
 def get_all_blocks(block_id):
-    """Vòng lặp tải toàn bộ block (vượt qua giới hạn 100 blocks của Notion API)"""
+    """Vòng lặp tải toàn bộ block để không bị giới hạn 100 blocks của Notion"""
     blocks = []
     cursor = None
     while True:
@@ -42,11 +43,10 @@ def get_all_blocks(block_id):
     return blocks
 
 def get_page_properties_html(page_id):
-    """Trích xuất các thuộc tính (Môn học, Status) ở đầu trang"""
+    """Trích xuất các thuộc tính ở đầu trang"""
     page = notion.pages.retrieve(page_id=page_id)
     html = '<div class="properties-container">'
     
-    # Lấy Tiêu đề chính
     title = "Untitled"
     for prop in page['properties'].values():
         if prop['type'] == 'title' and prop['title']:
@@ -54,7 +54,6 @@ def get_page_properties_html(page_id):
     html += f'<h1>{title}</h1>'
     html += '<table class="props-table">'
     
-    # Lấy các Properties khác
     for prop_name, prop in page['properties'].items():
         if prop['type'] == 'title': continue
         
@@ -88,6 +87,13 @@ def parse_blocks_to_html(blocks):
     for block in blocks:
         b_type = block['type']
         
+        # Kiểm tra xem block có chứa block con không (để xử lý list thụt lề)
+        has_children = block.get('has_children', False)
+        children_html = ""
+        if has_children and b_type != 'column_list':
+            child_blocks = get_all_blocks(block['id'])
+            children_html = parse_blocks_to_html(child_blocks)
+            
         if b_type == 'paragraph':
             text = "".join([t['plain_text'] for t in block['paragraph']['rich_text']])
             html_content += f"<p>{text}</p>" if text.strip() else "<br>"
@@ -99,11 +105,12 @@ def parse_blocks_to_html(blocks):
             
         elif b_type == 'bulleted_list_item':
             text = "".join([t['plain_text'] for t in block['bulleted_list_item']['rich_text']])
-            html_content += f"<ul><li>{text}</li></ul>"
+            # Nhúng children_html vào bên trong thẻ li để hiển thị bullet con
+            html_content += f"<ul><li>{text}{children_html}</li></ul>"
             
         elif b_type == 'numbered_list_item':
             text = "".join([t['plain_text'] for t in block['numbered_list_item']['rich_text']])
-            html_content += f"<ol><li>{text}</li></ol>"
+            html_content += f"<ol><li>{text}{children_html}</li></ol>"
             
         elif b_type == 'callout':
             text = "".join([t['plain_text'] for t in block['callout']['rich_text']])
@@ -118,6 +125,7 @@ def parse_blocks_to_html(blocks):
             
         elif b_type == 'equation':
             expr = block['equation']['expression']
+            # Bỏ qua mã LaTeX tạo đường kẻ
             if "\\rule" not in expr and "\\color" not in expr:
                 html_content += f"<p><i>{expr}</i></p>"
                 
@@ -130,14 +138,26 @@ def parse_blocks_to_html(blocks):
                 
         elif b_type == 'column_list':
             columns = get_all_blocks(block['id'])
-            html_content += '<div class="column-list">'
-            for i, col in enumerate(columns):
-                col_class = "col-left" if i == 0 else "col-right"
-                html_content += f'<div class="{col_class}">'
+            
+            # THUẬT TOÁN NHẬN DIỆN CỘT THÔNG MINH
+            is_cornell = False
+            if len(columns) > 0:
+                first_col_blocks = get_all_blocks(columns[0]['id'])
+                if first_col_blocks and first_col_blocks[0]['type'] == 'paragraph':
+                    first_text = "".join([t['plain_text'] for t in first_col_blocks[0]['paragraph']['rich_text']])
+                    if "Keyword" in first_text:
+                        is_cornell = True
+            
+            table_class = "cornell-body" if is_cornell else "normal-cols"
+            html_content += f'<table class="layout-table {table_class}"><tr>'
+            
+            for col in columns:
+                html_content += '<td>'
                 col_blocks = get_all_blocks(col['id'])
                 html_content += parse_blocks_to_html(col_blocks) 
-                html_content += '</div>'
-            html_content += '<div style="clear: both;"></div></div>'
+                html_content += '</td>'
+                
+            html_content += '</tr></table>'
             
     return html_content
 
@@ -154,7 +174,7 @@ def generate_pdf(html_body):
             body {{
                 font-family: 'Montserrat', sans-serif; font-size: 11pt; line-height: 1.6; color: #333; margin: 0; padding: 0;
             }}
-            /* CSS Properties */
+            
             h1 {{ font-size: 24pt; margin-bottom: 10px; }}
             .properties-container {{ margin-bottom: 20px; }}
             .props-table {{ width: 100%; border-collapse: collapse; font-size: 10pt; color: #555; }}
@@ -162,16 +182,29 @@ def generate_pdf(html_body):
             .prop-name {{ width: 200px; font-weight: 600; color: #777; }}
             .divider {{ border: none; border-top: 1px solid #eee; margin: 20px 0; }}
             
-            /* CSS Content Blocks */
+            /* Sửa khoảng cách Bullet Point */
             ul, ol {{ margin-top: 0; margin-bottom: 0; padding-left: 20px; }}
-            li {{ margin-bottom: 5px; }}
-            blockquote {{ border-left: 3px solid #333; margin: 10px 0; padding-left: 15px; font-style: italic; }}
-            .callout {{ background-color: #f1f5f9; padding: 15px; border-radius: 6px; margin: 15px 0; font-weight: 500; }}
+            ul ul, ol ol, ul ol, ol ul {{ margin-top: 0; }}
+            li {{ margin-bottom: 4px; }}
             
-            /* CSS Chia Cột Float (Chống vỡ trang) */
-            .column-list {{ width: 100%; }}
-            .col-left {{ float: left; width: 30%; border-right: 2px solid #EBECED; padding-right: 15px; font-weight: 600; }}
-            .col-right {{ float: left; width: 70%; padding-left: 15px; }}
+            blockquote {{ border-left: 3px solid #333; margin: 10px 0; padding-left: 15px; font-style: italic; }}
+            
+            /* Sửa Callout tràn viền */
+            .callout {{ background-color: #f1f5f9; padding: 12px 15px; border-radius: 6px; margin: 10px 0; font-weight: 600; width: 100%; box-sizing: border-box; }}
+            
+            /* CSS CHỐNG LỖI TRANG TRẮNG VÀ BẢNG */
+            table.layout-table {{ width: 100%; border-collapse: collapse; table-layout: fixed; margin-bottom: 20px; }}
+            table.layout-table, table.layout-table tr, table.layout-table td {{ 
+                page-break-inside: auto !important; 
+                vertical-align: top; 
+            }}
+            
+            /* Định dạng 30-70 cho bài học */
+            .cornell-body td:first-child {{ width: 30%; border-right: 2px solid #EBECED; padding-right: 15px; font-weight: 600; }}
+            .cornell-body td:last-child {{ width: 70%; padding-left: 15px; }}
+            
+            /* Định dạng 50-50 cho Tiêu đề/Ngày tháng */
+            .normal-cols td {{ padding: 0 5px; }}
         </style>
     </head>
     <body>
@@ -213,7 +246,6 @@ if notion_url:
                     blocks = get_all_blocks(page_id)
                     content_html = parse_blocks_to_html(blocks)
                     
-                    # Ghép Properties và Content lại
                     full_html_body = properties_html + content_html
                     
                     pdf_bytes = generate_pdf(full_html_body)
