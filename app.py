@@ -4,6 +4,7 @@ import requests
 import base64
 import re
 from weasyprint import HTML
+import fitz  # Đây là thư viện của PyMuPDF
 
 # Lấy API Key từ Streamlit Secrets
 NOTION_API_KEY = st.secrets["NOTION_API_KEY"]
@@ -123,9 +124,23 @@ def generate_pdf(html_body):
     return pdf_bytes
 
 def show_pdf_preview(pdf_bytes):
-    base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
-    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="800" type="application/pdf"></iframe>'
-    st.markdown(pdf_display, unsafe_allow_html=True)
+    """Đọc PDF và hiển thị từng trang dưới dạng hình ảnh để không bị Chrome chặn"""
+    try:
+        # Mở file PDF trực tiếp từ bộ nhớ đệm
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        
+        # Duyệt qua từng trang và tạo ảnh
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            # dpi=150 để ảnh hiển thị nét, có thể tăng lên 200 nếu muốn nét hơn
+            pix = page.get_pixmap(dpi=150) 
+            img_bytes = pix.tobytes("png")
+            
+            # Hiển thị ảnh lên giao diện Streamlit
+            st.image(img_bytes, caption=f"Trang {page_num + 1}", use_column_width=True)
+            st.markdown("---") # Đường kẻ phân cách giữa các trang
+    except Exception as e:
+        st.error(f"Không thể tạo bản xem trước: {str(e)}")
 
 # Giao diện Streamlit
 st.set_page_config(page_title="Notion to PDF", layout="wide")
