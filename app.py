@@ -25,9 +25,16 @@ def set_document_font(doc, font_name='Montserrat', font_size=14):
     font.size = Pt(font_size)
 
 def extract_page_id(url):
-    """Trích xuất Page ID từ link Notion"""
-    match = re.search(r"([a-f0-9]{32})", url.replace("-", ""))
-    return match.group(1) if match else None
+    # Lấy phần chính của URL, bỏ qua các thông số tracking phía sau dấu ?
+    base_url = url.split('?')[0]
+    # Lấy đoạn cuối cùng của link
+    last_segment = base_url.split('/')[-1]
+    # Xóa toàn bộ dấu gạch ngang
+    clean_segment = last_segment.replace("-", "")
+    # Luôn lấy chính xác 32 ký tự cuối cùng (độ dài chuẩn của Notion ID)
+    if len(clean_segment) >= 32:
+        return clean_segment[-32:]
+    return None
 
 def parse_notion_blocks(blocks, doc):
     """Hàm duyệt qua các block của Notion và đẩy vào Word"""
