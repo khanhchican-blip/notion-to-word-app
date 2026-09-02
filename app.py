@@ -4,7 +4,7 @@ import requests
 import base64
 import re
 from weasyprint import HTML
-import fitz  # Đây là thư viện của PyMuPDF
+import fitz  # PyMuPDF
 
 # Lấy API Key từ Streamlit Secrets
 NOTION_API_KEY = st.secrets["NOTION_API_KEY"]
@@ -51,6 +51,16 @@ def parse_blocks_to_html(blocks):
             text = "".join([t['plain_text'] for t in block[b_type]['rich_text']])
             html_content += f"<h{level}>{text}</h{level}>"
             
+        # Bổ sung xử lý danh sách gạch đầu dòng
+        elif b_type == 'bulleted_list_item':
+            text = "".join([t['plain_text'] for t in block['bulleted_list_item']['rich_text']])
+            html_content += f"<ul><li>{text}</li></ul>"
+            
+        # Bổ sung xử lý danh sách đánh số
+        elif b_type == 'numbered_list_item':
+            text = "".join([t['plain_text'] for t in block['numbered_list_item']['rich_text']])
+            html_content += f"<ol><li>{text}</li></ol>"
+            
         elif b_type == 'equation':
             expr = block['equation']['expression']
             if "\\rule" not in expr and "\\color" not in expr:
@@ -86,19 +96,23 @@ def generate_pdf(html_body):
         <style>
             @page {{
                 size: A4;
-                margin: 20mm 15mm; /* Lề giấy A4 chuẩn cho WeasyPrint */
+                margin: 20mm 15mm; 
             }}
             * {{
                 box-sizing: border-box;
             }}
             body {{
                 font-family: 'Montserrat', sans-serif;
-                font-size: 11pt; /* Font 11pt trên Weasyprint tương đương size 14 trên web */
+                font-size: 11pt; 
                 line-height: 1.6;
                 color: #333;
                 margin: 0;
                 padding: 0;
             }}
+            /* CSS gom các gạch đầu dòng lại cho liền mạch */
+            ul, ol {{ margin-top: 0; margin-bottom: 0; padding-left: 20px; }}
+            li {{ margin-bottom: 5px; }}
+            
             .cornell-table {{
                 width: 100%;
                 border-collapse: collapse;
@@ -119,26 +133,19 @@ def generate_pdf(html_body):
     </body>
     </html>
     """
-    # Dùng WeasyPrint để kết xuất HTML thành PDF dạng byte
     pdf_bytes = HTML(string=full_html).write_pdf()
     return pdf_bytes
 
 def show_pdf_preview(pdf_bytes):
-    """Đọc PDF và hiển thị từng trang dưới dạng hình ảnh để không bị Chrome chặn"""
     try:
-        # Mở file PDF trực tiếp từ bộ nhớ đệm
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        
-        # Duyệt qua từng trang và tạo ảnh
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
-            # dpi=150 để ảnh hiển thị nét, có thể tăng lên 200 nếu muốn nét hơn
             pix = page.get_pixmap(dpi=150) 
             img_bytes = pix.tobytes("png")
-            
-            # Hiển thị ảnh lên giao diện Streamlit
-            st.image(img_bytes, caption=f"Trang {page_num + 1}", use_column_width=True)
-            st.markdown("---") # Đường kẻ phân cách giữa các trang
+            # Cập nhật từ use_column_width sang use_container_width
+            st.image(img_bytes, caption=f"Trang {page_num + 1}", use_container_width=True)
+            st.markdown("---") 
     except Exception as e:
         st.error(f"Không thể tạo bản xem trước: {str(e)}")
 
